@@ -21,14 +21,14 @@
 
 (require 'dash)
 (require 'dash-functional)
-;; for `cl--expr-depends-p'
 (require 'cl-lib)
+(require 'cl-macs) ; `cl--expr-depends-p'
 (require 'macroexp)
 (require 'byte-opt)
 (eval-when-compile
   (require 'pcase))
 
-(defconst tco--tail-optimizers
+(defvar tco--special-form-optimizers
   (--map (cons it (intern (format "tco--convert-%s" it)))
          '(and
            condition-case
@@ -62,12 +62,12 @@
       (push (pop list) before))
     (list (nreverse before) (car list))))
 
-(defconst tco--special-form-restorers
+(defvar tco--special-form-restorers
   (mapcar (-lambda ((special-form . tco-fun))
             (cons tco-fun
                   (lambda (&rest args)
                     (cons special-form args))))
-          tco--tail-optimizers))
+          tco--special-form-optimizers))
 
 (defvar tco--retvar nil
   "Dynamically bound during TCO to the name of the variable
@@ -77,9 +77,9 @@ assigned to the iteration's return value.")
   "Dynamically bound during TCO to the macroexpansion environment
 that processess special forms.")
 
-;; (defvar tco--reserved-bindings nil
-;;   "Dynamically bound during TCO to the the variables which were
-;;   established by the `clj-loop'.")
+(defvar tco--used-retvar nil
+  "Dynamically bound during TCO and set to t when a form returned
+  anything but nil.")
 
 (defun tco--convert-let (binds &rest body)
   `(tco--convert-let
@@ -94,18 +94,15 @@ that processess special forms.")
 (defun tco--mexp (form)
   "macroexpand FORM in `tco--expansion-env'.
 If it doesn't expand, emit a form that terminates iteration."
-  (let ((expanded (macroexpand form tco--expansion-env)))
-    (cond
-      ;; macroexpanded, return that
-      ((not (eq expanded form)) expanded)
-      ;; else its a returning form, so set the return var to its value
-      ((byte-compile-nilconstp form) ;if it's null, no need to wrap it in (progn FORM nil)
-       `(setq ,tco--retvar ,form))
-      (t `(tco--convert-progn (setq ,tco--retvar ,form) nil)))))
+  (unless (byte-compile-nilconstp form)
+    (let ((expanded (macroexpand form tco--expansion-env)))
+      (if (not (eq expanded form))
+          expanded
+        (setq tco--used-retvar t)
+        `(tco--convert-progn (setq ,tco--retvar ,form) nil)))))
 
 (defun tco--prognize (forms)
-  (if (null forms)
-      `((setq ,tco--retvar nil))
+  (when forms
     (let (r)
       (while (cdr forms)
         (push (pop forms) r))
@@ -120,6 +117,7 @@ If it doesn't expand, emit a form that terminates iteration."
 (defun tco--convert-and (&rest args)
   (cond
     ((null args)
+     (setq tco--used-retvar t)
      `(tco--convert-progn (setq ,tco--retvar t) nil))
     ((null (cdr args)) (tco--mexp (car args)))
     (t (-let [(butl last) (tco--split-end args)]
@@ -128,24 +126,16 @@ If it doesn't expand, emit a form that terminates iteration."
            ,(tco--mexp last))))))
 
 (defun tco--convert-or (&rest args)
-  ;; (pcase args
-  ;;   (`() `(setq ,tco--retvar nil))
-  ;;   (`(,one) (tco--mexp one))
-  ;;   ((app clj--split-list-end `(,butl ,last))
-  ;;    `(tco--convert-if
-  ;;      (setq ,tco--retvar
-  ;;            (tco--convert-or ,@butl))
-  ;;      nil
-  ;;      ,(tco--mexp last))))
-  (cond
-    ((null args) `(setq ,tco--retvar nil))
-    ((null (cdr args)) (tco--mexp (car args)))
-    (t (-let [(butl last) (tco--split-end args)]
-         `(tco--convert-if
-           (setq ,tco--retvar
-                 (tco--convert-or ,@butl))
-           nil
-           ,(tco--mexp last))))))
+  (when args
+    (cond
+      ((null (cdr args)) (tco--mexp (car args)))
+      (t (setq tco--used-retvar t)
+         (-let [(butl last) (tco--split-end args)]
+           `(tco--convert-if
+             (setq ,tco--retvar
+                   (tco--convert-or ,@butl))
+             nil
+             ,(tco--mexp last)))))))
 
 (defun tco--convert-condition-case (var form &rest handlers)
   `(tco--convert-condition-case
@@ -157,21 +147,24 @@ If it doesn't expand, emit a form that terminates iteration."
 (defun tco--convert-if (test then &rest else)
   (cond
     ((byte-compile-trueconstp test) (tco--mexp then))
-    ((byte-compile-nilconstp test) (apply #'tco--convert-progn else))
-    (t `(tco--convert-if ,test
-                     ,(tco--mexp then)
-                     ,@(tco--prognize else)))))
+    ((byte-compile-nilconstp test)
+     (apply #'tco--convert-progn else))
+    (t `(tco--convert-if
+         ,test
+         ,(tco--mexp then)
+         ,@(tco--prognize else)))))
 
 (defun tco--convert-cond (&rest conds)
   (when conds
-    (let ((rescond '(tco--convert-cond)))
+    (let ((rescond (list 'tco--convert-cond)))
       (while conds
         ;; these transformations are done by `byte-optimize-cond', but it makes
         ;; the tco process easier to work with if they're performed here
         (pcase (car conds)
           (`(,test)
-            (push `(t ,(apply #'tco--convert-or test
-                              (apply #'tco--convert-cond (cdr conds))))
+            (push `(t ,(tco--convert-or
+                        test
+                        (apply #'tco--convert-cond (cdr conds))))
                   rescond)
             (setq conds nil))
           (`(,test . ,forms)
@@ -181,13 +174,14 @@ If it doesn't expand, emit a form that terminates iteration."
               (setq conds (unless (byte-compile-trueconstp test) (cdr conds)))))))
       (nreverse rescond))))
 
-(defun tco--make-recur (vars vals extras)
+(defun tco--make-recur (vars vals before after)
   "Adapted from `cl-psetf'. Always returns t."
   (let ((varlen (length vars))
         (vallen (length vals)))
     (unless (eq varlen vallen)
       (signal 'wrong-number-of-arguments (list varlen vallen))))
-  (or (and (null vars) (null extras)) ;; nothing to set, just tell `while' to keep going
+  (or (and (null vars) (null before) (null after)) ; nothing to set, just tell
+                                                   ; `while' to keep going
       (let* ((zipped (-zip-lists vars vals))
              (p zipped)
              (vs nil)
@@ -197,31 +191,34 @@ If it doesn't expand, emit a form that terminates iteration."
             (when (cl--expr-depends-p val vs)
               (setq simple nil))
             (push var vs)))
-        (if simple
-            `(tco--convert-progn
-              (setq ,@(apply #'nconc zipped))
-              ,@extras t)
-          (-let [(r1 . rev) (nreverse zipped)]
-            `(tco--convert-progn
-              ,(-reduce-from (-lambda (acc (var val))
-                               `(setq ,var (prog1 ,val ,acc)))
-                             (cons 'setq r1) rev)
-               ,@extras
-               t))))))
+        (let ((resetter
+               (if simple
+                   `(setf ,@(apply #'nconc zipped))
+                 (-let [(r1 . rev) (nreverse zipped)]
+                   (-reduce-from (-lambda (acc (var val))
+                                   `(setf ,var (prog1 ,val ,acc)))
+                                 (cons 'setq r1) rev)))))
+          `(tco--convert-progn ,@before ,resetter ,@after t)))))
+
+(defun tco--normalize-binds (binds)
+  (--map (pcase it
+           (`(,_ ,_) it)
+           (`(,s) (list s nil))
+           (_ (list it nil)))
+         binds))
 
 (defun tco--merge-lets (lets forms &optional reserved)
   (let ((continue? t))
     (while (and forms (null (cdr forms)) continue?)
       (pcase (car forms)
-        (`(let ,(app clj--normalize-binds binds) . ,inner)
+        (`(let ,(app tco--normalize-binds binds) . ,inner)
           (if (or (cdr binds)
                   (and binds (memq (caar binds) reserved)))
               (setq continue? nil)
             (setq lets (append lets binds))
             (setq forms inner)))
-        (`(let* ,(app clj--normalize-binds binds) . ,inner)
-          (if (and reserved
-                   (--any? (memq (car it) reserved) binds))
+        (`(let* ,(app tco--normalize-binds binds) . ,inner)
+          (if (and reserved (--any? (memq (car it) reserved) binds))
               (setq continue? nil)
             (setq lets (append lets binds))
             (setq forms inner)))
@@ -230,46 +227,6 @@ If it doesn't expand, emit a form that terminates iteration."
 
 (defun tco--merging-let* (lets &rest forms)
   (cons 'tco--merging-let* (tco--merge-lets lets forms)))
-
-(defun tco--unwrap-progns (form &optional fun-to-call)
-  "*Completely* flattens all nested progns in FORM into a single sequence of extressions.
-Empty progns become nil.
-
- (progn
-   x
-   y
-   (progn
-     (progn l)
-     (progn)
-     g
-     (progn lm a 0 r))
-   (progn
-     (progn)
-     (progn (progn (list 1 2)))))
-=> (x y l nil g lm a 0 r nil (list 1 2))"
-  (if (not (eq (car-safe form) 'progn))
-      (list (if fun-to-call
-                (funcall fun-to-call form)
-              form))
-    (let* ((i 5000) ;; fail-safe
-           (ff (append (cdr form) nil))
-           (unp ff))
-      (while (and unp (> i 0))
-        (setq i (1- i))
-        (let* ((rrest (cdr unp))
-               (ec (tco--unwrap-progns (car unp) fun-to-call)))
-          (setcar unp (car ec))
-          (setcdr unp (nconc (cdr ec) rrest))
-          (setq unp rrest)))
-      (when (zerop i)
-        (error "oops, `tco--unwrap-progns' infinite looped"))
-      ff)))
-
-(defun clj--unwrapping-progn (&rest forms)
-  (let ((e (tco--unwrap-progns (cons 'progn forms))))
-    (if (cdr e)
-        (cons 'clj--unwrapping-progn e)
-      (car e))))
 
 (defgroup tco nil
   "Tail call optimization."
@@ -285,6 +242,63 @@ This is primarily for aesthetic macroexpansion."
           (const 2 :tag "Go a little overboard")
           (const 3 :tag "Go nuts (don't choose this)")))
 
+(defun tco--unwrap-progns (form &optional fun-to-call)
+  "Completely flattens all nested progns in FORM into a single sequence of extressions.
+Empty progns become nil. With `tco-cleaning-level' > 1, nil's
+before the last form are removed.
+
+ (progn
+   x
+   y
+   (progn
+     (progn l)
+     (progn)
+     g
+     (progn lm a 0 r))
+   (progn
+     (progn)
+     (progn
+       (progn (list 1 2))
+       (progn))))
+=> (x y l g lm a 0 r (list 1 2) nil)"
+  ;; (if (not (eq (car-safe form) 'progn))
+  ;;     (list (if fun-to-call
+  ;;               (funcall fun-to-call form)
+  ;;             form))
+  ;;   (let* ((i 5000) ;; fail-safe
+  ;;          (ff (append (cdr form) nil))
+  ;;          (unp ff))
+  ;;     (while (and unp (> i 0))
+  ;;       (setq i (1- i))
+  ;;       (let* ((rrest (cdr unp))
+  ;;              (ec (tco--unwrap-progns (car unp) fun-to-call)))
+  ;;         (while (and (null ec) rrest (> i 0))
+  ;;           (setq i (1- i))
+  ;;           (setq ec (tco--unwrap-progns (car rrest) fun-to-call))
+  ;;           (setq rrest (cdr rrest)))
+  ;;         (setcar unp (car ec))
+  ;;         (setcdr unp (nconc (cdr ec) rrest))
+  ;;         (setq unp rrest)))
+  ;;     (when (zerop i)
+  ;;       (error "oops, `tco--unwrap-progns' infinite looped"))
+  ;;     ff))
+  (if (and (eq (car-safe form) 'progn)
+           (setq form (cdr form)))
+      (let* ((mc (mapcan (lambda (x)
+                           (tco--unwrap-progns x fun-to-call))
+                         form))
+             (cc mc))
+        (when (> tco-cleaning-level 1)
+          (while (cdr cc)
+            (if (car cc)
+                (setq cc (cdr cc))
+              (setcar cc (cadr cc))
+              (setcdr cc (cddr cc)))))
+        mc)
+    (list (if (and form fun-to-call)
+              (funcall fun-to-call form)
+            form))))
+
 (defun tco--cleanup (form)
   (letrec ((clean
             (lambda (form)
@@ -296,14 +310,18 @@ This is primarily for aesthetic macroexpansion."
                       (cons (car form) (mapcar clean stuff))
                     (funcall clean (car stuff))))
                 (`(progn . ,_)
-                  (macroexp-progn (funcall clean-implicit-progn form)))
+                  (funcall clean-implicit-progn form))
                 (`(if ,test ,then . ,else)
                   `(if ,(funcall maybe-clean test)
                        ,(funcall clean then)
                      ,@(funcall clean-implicit-progn else)))
+                (`(cond . ,conds)
+                  (cons 'cond (--map (cons (funcall clean (car it))
+                                           (funcall clean-implicit-progn (cdr it)))
+                                     conds)))
                 (`(let* ,binds . ,forms)
                   (-let [(bs . fs)
-                         (if (>= tco-cleaning-level 2)
+                         (if (> tco-cleaning-level 1)
                              (tco--merge-lets binds forms)
                            (cdr form))]
                     `(let* ,(funcall clean-let-binds bs)
@@ -315,7 +333,7 @@ This is primarily for aesthetic macroexpansion."
                   `(condition-case ,v
                        ,(funcall clean f)
                      ,@(--map (cons (car it)
-                                    (tco--unwrap-progns (cons 'progn (cdr it)) clean))
+                                    (funcall clean-implicit-progn (cdr it)))
                               handlers)))
                 (`(setq . ,_) (funcall clean-setq form))
                 ((guard (< tco-cleaning-level 2)) form)
@@ -324,9 +342,9 @@ This is primarily for aesthetic macroexpansion."
                         'save-current-buffer)
                     . ,stuff)
                   `(,(car form) ,@(funcall clean-implicit-progn stuff)))
-                (`(,(or 'prog1 'unwind-protect 'while) ,form1 . ,forms)
+                (`(,(or 'prog1 'unwind-protect 'while 'catch) ,form1 . ,forms)
                   `(,(car form) ,(funcall clean form1)
-                     ,@(tco--unwrap-progns (cons 'progn forms) clean)))
+                     ,@(funcall clean-implicit-progn forms)))
                 ((guard (< tco-cleaning-level 3)) form)
                 (`(,(and (pred symbolp)
                          (pred fboundp)
@@ -337,7 +355,7 @@ This is primarily for aesthetic macroexpansion."
                       `(function (lambda ,(and (pred listp) args) . ,body)))
                  `(function
                    (lambda ,args
-                    ,@(tco--unwrap-progns (cons 'progn body) clean))))
+                    ,@(funcall clean-implicit-progn body))))
                 (_ form))))
            (clean-implicit-progn
             (if (> tco-cleaning-level 1)
@@ -366,80 +384,6 @@ This is primarily for aesthetic macroexpansion."
                           #'identity)))
     (funcall clean form)))
 
-(defun clj--loop-normalize-1 (forms env)
-  "Set up FORMS for TCO."
-  (let* (;; number of recurs encountered
-         ;; currently this is only used as a boolean flag; when it's zero,
-         ;; there was no recursion, so this can just be converted to a let.
-         ;; (recurs 0)
-         ;; expand every (compiler) macro and replace `clj-recur' with the
-         ;; placeholder `clj--loop-recur', which itself is then converted to a
-         ;; form that updates RESETTERS and continues the loop
-         (newenv `((clj-recur . ,(lambda (&rest args)
-                                   ;; (setf recurs (1+ recurs))
-                                   (cons 'clj--loop-recur args)))
-                   ,@env)))
-    (--map (macroexpand-all it newenv) forms)))
-
-;; (defun clj--loop-normalize-2 (body env reserved)
-;;   "BODY is already macroexpanded, RESERVED is the initial
-;; variables that can't be converted to a setq in the loop."
-;;   (-let* (((initextras . body1)
-;;            (tco--merge-lets nil body reserved))
-;;           (exp (macroexpand-all (macroexp-progn (tco--unwrap-progns body1))
-;;                                 `((let* . tco--merging-let*)
-;;                                   (clj--unwrapping-progn
-;;                                    . ,(lambda (&rest forms)
-;;                                         (cons 'progn forms)))
-;;                                   ,@env))))
-;;     (cons initextras exp)))
-
-(defun tco--collect-loop-lexical-stuff
-    (binds skip-recur-vars remove-rebinds?)
-  "BINDS are all like (pattern value)
-returns (initial-bindings recur-vars destructuring-setqs)"
-  (let (all-bindings
-        rebinders
-        ds-setters)
-    (dolist (bind binds)
-      (-let* (((expanded &as main . dsbinds)
-               (clj--destructure1 (list bind))))
-        (push (if (and remove-rebinds?
-                       (apply #'eq main))
-                  dsbinds
-                expanded)
-              all-bindings)
-        (push (--map (cons 'setq it) dsbinds) ds-setters)
-        (if (zerop skip-recur-vars)
-            (push (car main) rebinders)
-          (setf skip-recur-vars (1- skip-recur-vars)))))
-    (list (apply #'append (nreverse all-bindings))
-          (nreverse rebinders)
-          (apply #'nconc (nreverse ds-setters)))))
-
-(defun tco--perform (resetters ds-setters loop-body previousenv)
-  (let* (;; the variable returned by the final macroexpansion
-         (tco--retvar (make-symbol "clj-loop-result"))
-         (tail-recurs 0)
-         (optimized
-          ;; macroexpand with the optimizers in effect
-          (let ((tco--expansion-env
-                 ;; (append tco--tail-optimizers previousenv)
-                 `((clj--loop-recur
-                    . ,(lambda (&rest args)
-                         (setq tail-recurs (1+ tail-recurs))
-                         (tco--make-recur resetters args ds-setters)))
-                   ,@tco--tail-optimizers
-                   ,@previousenv)))
-            (tco--mexp loop-body)))
-         ;; restore the real special forms
-         (restored
-          (macroexpand-all
-           optimized
-           (append tco--special-form-restorers previousenv))))
-    ;; return the number of recur calls, return variable and tco'd body
-    (list tail-recurs tco--retvar restored)))
-
 (defun tco--tail-some (pred form)
   (pcase form
     (`(and) (funcall pred t))
@@ -453,33 +397,222 @@ returns (initial-bindings recur-vars destructuring-setqs)"
       (or (tco--tail-some pred form)
           (--some (tco--tail-some pred (-last-item (cdr it))) handlers)))
     (`(cond . ,conds)
-      ())
+      (--some (tco--tail-some pred (-last-item it)) conds))
     (_ (funcall pred form))))
 
-(defun clj--loop-expand
-    (binds body &optional remove-rebinds? recur-exclude-count)
-  (-let* ((envyy macroexpand-all-environment)
-          (normal (clj--loop-normalize-1 body envyy))
-          ((initbinds recurvars ds-setqs)
-           (tco--collect-loop-lexical-stuff
-            (clj-->elisp-let-binds binds)
-            (or recur-exclude-count 0) remove-rebinds?))
-          (doit
-           (lambda (forms1)
-             (-let* (((_recurs retvar optimized)
-                      (tco--perform
-                       recurvars ds-setqs
-                       (macroexp-progn forms1)
-                       envyy))
-                     (clean (tco--cleanup optimized)))
-               `(let* (,@initbinds ,retvar)
-                  (while ,clean)
-                  ,retvar))))
-          (recurcheck (lambda (x)
-                        (eq (car-safe x) 'clj--loop-recur))))
-    (if (tco--tail-some recurcheck (car (last normal)))
-        (funcall doit normal)
-      `(clj-let ,binds . ,body))))
+(cl-defstruct
+    (tco-recursion-point
+      ;; (:copier nil)
+      ;; (:constructor nil)
+      (:constructor tco-recursion-point
+       (name recur-places
+             &key
+             pre-recur
+             post-recur
+             (non-tail-handler
+              (lambda (&rest args)
+                (error "Attempted to call %s in non-tail position: %s"
+                       name (cons name args))))
+             &aux (temp-name (gensym "recur-point")))))
+  "Instructions for how to convert forms starting with the symbol NAME.
+RECUR-PLACES are the names of variables (or gv places) whose
+values are reset to the arguments to NAME. PRE-RECUR and
+POST-RECUR, if provided, are forms executed before and after
+RECUR-PLACES are reset. NON-TAIL-HANDLER is a function called
+with the args to NAME to produce a form when NAME is in
+non-tail position; by default an error is signaled."
+  name
+  recur-places
+  pre-recur
+  post-recur
+  non-tail-handler
+  temp-name)
+
+;;;###autoload
+(defun tco-expand (body &optional env &rest recursion-points)
+  "Perform tail-call optimization on BODY."
+  (cond
+    ((tco-recursion-point-p env)
+     (push env recursion-points))
+    ((null recursion-points)
+     (error "`tco-expand' requires one or more `tco-recursion-point's.")))
+  (let* ((tco--retvar (make-symbol "result"))
+         (tco--used-retvar nil)
+         (converted 0)
+         ;; first expand all macros in BODY and replace all RECURSION-POINTS
+         ;; with placeholder forms that are processed in the second pass
+         (first-pass
+          (mapcar (-lambda ([_ name _ _ _ _ tempname])
+                    (cons name (lambda (&rest args)
+                                 (cons tempname args))))
+                  recursion-points))
+         ;; convert all tagged recur points in tail position into forms which
+         ;; update their places and continue the while loop
+         (second-pass
+          (mapcar (-lambda ([_ _ places pre post _ tempname])
+                    (cons tempname
+                          (lambda (&rest args)
+                            (setq converted (1+ converted))
+                            (tco--make-recur places args pre post))))
+                  recursion-points))
+         ;; finally, calls each recur point's non-tail-handler on any calls
+         ;; which were not in tail position
+         (third-pass
+          (mapcar (-lambda ([_ _ _ _ _ handler tempname])
+                    (cons tempname handler))
+                  recursion-points))
+         (tagged (macroexpand-all (macroexp-progn body) (nconc first-pass env)))
+         (tco--expansion-env
+          (nconc second-pass tco--special-form-optimizers))
+         (expanded (tco--mexp tagged))
+         (post-processed (macroexpand-all
+                          expanded
+                          (nconc third-pass tco--special-form-restorers))))
+    (list `(while ,(if (> tco-cleaning-level 0)
+                       (tco--cleanup post-processed)
+                     post-processed))
+          tco--retvar converted tco--used-retvar)))
+
+;;;###autoload
+(defun tco-simple-expand (recurname recur-places body &optional env)
+  "Invokes `tco-expand' with appropriate arguments for RECURNAME
+to be a recursive call rebinding RECUR-PLACES."
+  (tco-expand body env (tco-recursion-point recurname recur-places)))
+
+;;;###autoload
+(defun tco-make-body (binds expansion-spec &optional origbody is-lambda?)
+  "Takes a list of let BINDS (or function arglist, when
+IS-LAMBDA?) and a list returned by `tco-expand' and returns (cons
+BINDS FINAL-ITERATION-FORM). Simply cons `let*' (or `lambda' or
+equivalent) onto it to create the final iteration form. If there
+were no recursive tail calls and ORIGBODY is provided, then
+returns (cons BINDS ORIGBODY) unchanged, else returns the
+aforementioned form regardless."
+  (-let [(whileform retvar recurcount retvarused?) expansion-spec]
+    (cond
+      ((and (zerop recurcount) origbody) `(,binds ,@origbody))
+      ((not is-lambda?)
+       (let ((rv (if retvarused? (list retvar))))
+         `((,@binds ,@rv) ,whileform ,@rv)))
+      ((not retvarused?) `(,binds ,whileform))
+      (t `(,binds (let (,retvar) ,whileform ,retvar))))))
+
+(defun tco--loop-lexical-stuff (binds &optional only-ds-inits)
+  "returns (initial-bindings recur-vars destructuring-setqs)"
+  (let (all-bindings rebinders ds-setters)
+    (dolist (bind (tco--normalize-binds binds))
+      (-let [(expanded &as (main) . dsbinds)
+             (apply #'dash--match bind)]
+        (push (--map (cons 'setq it) dsbinds) ds-setters)
+        (push main rebinders)
+        (push (if only-ds-inits
+                  dsbinds
+                expanded)
+              all-bindings)))
+    (list (apply #'append (nreverse all-bindings))
+          (nreverse rebinders)
+          (apply #'append (nreverse ds-setters)))))
+
+;;;###autoload
+(defmacro tco-loop (binds &rest body)
+  (declare (indent defun))
+  (-let* (((initbinds recurvars ds-setters)
+           (tco--loop-lexical-stuff binds))
+          (recurpoint (tco-recursion-point
+                       'tco-recur recurvars
+                       :post-recur ds-setters))
+          (env macroexpand-all-environment)
+          (expansion (tco-expand body env recurpoint))
+          ((finalbinds . finalbody)
+           (tco-make-body initbinds expansion body)))
+    (if finalbinds
+        `(let* ,finalbinds ,@finalbody)
+      (macroexp-progn finalbody))))
+
+(defun tco--lambda-lexical-stuff (args)
+  (let (arglist ds-stuff (i 0))
+    (dolist (arg args)
+      (setq i (1+ i))
+      (when (memq arg '(&optional &rest))
+        ;; coming soon, hopefully
+        (error "%s args are not allowed in `tco-lambda' yet" arg))
+      (if (symbolp arg)
+          (push arg arglist)
+        (let ((as (make-symbol (format "arg%d" i))))
+          (push as arglist)
+          (push (dash--match arg as) ds-stuff))))
+    (list (nreverse arglist)
+          (apply #'append (nreverse ds-stuff)))))
+
+(defmacro tco-recur (&rest args)
+  (ignore args)
+  (error "`tco-recur' called outside of `tco-lambda' or `tco-loop'."))
+
+;;;###autoload
+(defmacro tco-lambda (&rest body)
+  "`-lambda' with tail-call optimization.
+
+The first argument may be a non-nil symbol, in which case calls
+to that symbol in tail-position will be converted, and other
+calls remain regular recursive calls. Without a name, `tco-recur'
+can be used to recurse, but an error is signaled if it's not in
+tail position.
+
+\(fn [NAME] ARGLIST &rest BODY)"
+  (declare (indent defun))
+  (-let* (((name args body)
+           (if (nlistp (car body))
+               body
+             (cons 'tco-recur body)))
+          (boundname nil)
+          ((arglist ds) (tco--lambda-lexical-stuff args))
+          (recurpoint
+           (tco-recursion-point
+            name arglist
+            :post-recur ds
+            :non-tail-handler
+            ;; allow non-tail recursive calls when it's named
+            (if (eq name 'tco-recur)
+                (lambda (&rest args)
+                  (error (concat "`tco-recur' called from non-tail position: %s\n"
+                                 "Give the `tco-lambda' a name and call that to permit this.")
+                         (cons 'tco-recur args)))
+              (lambda (&rest args)
+                (unless boundname
+                  (setq boundname (make-symbol (symbol-name name))))
+                `(funcall ,boundname ,@args)))))
+          ;; ((whileform retvar recurcount retvarused?)
+          ;;  (tco-expand body macroexpand-all-environment recurpoint))
+          ;; (finalfun
+          ;;  (if (zerop recurcount)
+          ;;      `(lambda ,args
+          ;;         ,@(if (null ds)
+          ;;               body
+          ;;             `((let* ,ds ,@body))))
+          ;;    `(lambda ,args
+          ;;       (let* (,@ds ,retvar)
+          ;;         ,whileform
+          ;;         ,retvar))))
+          (expansion (tco-expand body macroexpand-all-environment recurpoint))
+          (finalfun (cons 'lambda (tco-make-body arglist expansion body :lambda))))
+    (if boundname
+        `(letrec ((,boundname ,finalfun)) ,boundname)
+      finalfun)))
+
+(with-eval-after-load 'cl-indent
+  ;; `common-lisp-indent-function' (which i use in elisp-mode) indents functions
+  ;; with 'defun lisp-indent-function properties exactly like an actual `defun',
+  ;; whereas `lisp-indent-function' just indents everything after the first line
+  ;; with `lisp-body-indent', which is what we want for named `tco-loop/let's
+  (defun tco--call-standard-lisp-indent-function (_path state indent-point &rest _)
+    "Make `tco-lambda' and `tco-loop' indent via the standard
+`lisp-indent-function' when the buffer's value of that variable
+is `common-lisp-indent-function'."
+    (lisp-indent-function indent-point state))
+  (put 'tco-lambda 'common-lisp-indent-function-for-elisp
+       #'tco--call-standard-lisp-indent-function)
+  (put 'tco-loop 'common-lisp-indent-function-for-elisp
+       #'tco--call-standard-lisp-indent-function))
 
 (provide 'tco)
 ;;; tco.el ends here
