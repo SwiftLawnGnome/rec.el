@@ -602,11 +602,13 @@ tail position.
                      `(funcall ,(cadr (assq name fun-stuff)) ,@vals))))
     (pcase-dolist (`(,fname ,fargs . ,fbody) funbinds)
       (-let* (((arglist ds) (tco--lambda-lexical-stuff fargs))
+              (setqs (when ds (cons 'setq (apply #'append ds))))
               (funsym (make-symbol (symbol-name fname)))
               (thisresult (gensym "inner-result"))
               (self-recur (tco-recursion-point
                            fname arglist
-                           :non-tail-handler non-tail))
+                           :non-tail-handler non-tail
+                           :post-recur setqs))
               (other-recur (tco-recursion-point
                             fname fargs
                             :non-tail-handler non-tail
@@ -616,21 +618,28 @@ tail position.
                                  (setq ,args-sym (list ,@vals))
                                  ,funsym)))))
         (push (cons fname other-recur) other-recurs)
-        (push (list fname funsym self-recur thisresult
-                    arglist (if ds `((let* ,ds ,@fbody)) fbody))
+        (push (list fname funsym self-recur
+                    thisresult arglist
+                    (if ds `((let* ,ds ,@fbody)) fbody))
               fun-stuff)))
     (pcase-dolist (`(,name ,sym ,selfrecur ,thisres ,args ,lbody) fun-stuff)
+      (message "doing %s" name)
       (-let* ((others (--keep (unless (eq (car it) name) (cdr it)) other-recurs))
               (exp1 (tco-perform lbody env thisres selfrecur))
-              ((args1 . stuff) (tco-make-simple-body args exp1 lbody :lambda))
-              (expansion (apply #'tco-perform stuff env result-sym others)))
-        (push (list sym `(lambda ,@(tco-make-simple-body
-                                    args1 expansion
-                                    stuff :lambda)))
+              ((args1 . stuff)
+               (tco-make-simple-body args exp1 lbody :lambda))
+              ((whileform _ _ recurcount)
+               (apply #'tco-perform stuff env result-sym others)))
+        (push (list sym `(lambda ,args1
+                           ,@(if recurcount
+                                 `((while ,whileform))
+                               whileform)))
               fun-letrecs)))
-    (let* ((mainexp (apply #'tco-perform body env result-sym
-                           (mapcar #'cdr other-recurs)))
-           (fun0 `(lambda ,@(tco-make-simple-body nil mainexp nil :lambda))))
+    (-let* (((mainbody _ _ rc)
+             (apply #'tco-perform body env
+                    result-sym
+                    (mapcar #'cdr other-recurs)))
+            (fun0 `(lambda () ,mainbody)))
       `(letrec ((,result-sym nil)
                 (,args-sym nil)
                 (,curf-sym ,fun0)
