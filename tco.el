@@ -82,14 +82,10 @@ that processess special forms.")
   anything but nil.")
 
 (defun tco--convert-let (binds &rest body)
-  `(tco--convert-let
-    ,binds
-    ,@(tco--prognize body)))
+  `(tco--convert-let ,binds ,@(tco--prognize body)))
 
 (defun tco--convert-let* (binds &rest body)
-  `(tco--convert-let*
-    ,binds
-    ,@(tco--prognize body)))
+  `(tco--convert-let* ,binds ,@(tco--prognize body)))
 
 (defun tco--mexp (form)
   "macroexpand FORM in `tco--expansion-env'.
@@ -174,7 +170,7 @@ If it doesn't expand, emit a form that terminates iteration."
               (setq conds (unless (byte-compile-trueconstp test) (cdr conds)))))))
       (nreverse rescond))))
 
-(defun tco--make-recur (vars vals before after)
+(defun tco--make-recur (_name vars vals before after)
   "Adapted from `cl-psetf'. Always returns t."
   (let ((varlen (length vars))
         (vallen (length vals)))
@@ -198,7 +194,7 @@ If it doesn't expand, emit a form that terminates iteration."
                    (-reduce-from (-lambda (acc (var val))
                                    `(setf ,var (prog1 ,val ,acc)))
                                  (cons 'setq r1) rev)))))
-          `(tco--convert-progn ,@before ,resetter ,@after t)))))
+          `(progn ,@before ,resetter ,@after t)))))
 
 (defun tco--normalize-binds (binds)
   (--map (pcase it
@@ -224,9 +220,6 @@ If it doesn't expand, emit a form that terminates iteration."
             (setq forms inner)))
         (_ (setq continue? nil))))
     (cons lets forms)))
-
-(defun tco--merging-let* (lets &rest forms)
-  (cons 'tco--merging-let* (tco--merge-lets lets forms)))
 
 (defgroup tco nil
   "Tail call optimization."
@@ -261,27 +254,6 @@ before the last form are removed.
        (progn (list 1 2))
        (progn))))
 => (x y l g lm a 0 r (list 1 2) nil)"
-  ;; (if (not (eq (car-safe form) 'progn))
-  ;;     (list (if fun-to-call
-  ;;               (funcall fun-to-call form)
-  ;;             form))
-  ;;   (let* ((i 5000) ;; fail-safe
-  ;;          (ff (append (cdr form) nil))
-  ;;          (unp ff))
-  ;;     (while (and unp (> i 0))
-  ;;       (setq i (1- i))
-  ;;       (let* ((rrest (cdr unp))
-  ;;              (ec (tco--unwrap-progns (car unp) fun-to-call)))
-  ;;         (while (and (null ec) rrest (> i 0))
-  ;;           (setq i (1- i))
-  ;;           (setq ec (tco--unwrap-progns (car rrest) fun-to-call))
-  ;;           (setq rrest (cdr rrest)))
-  ;;         (setcar unp (car ec))
-  ;;         (setcdr unp (nconc (cdr ec) rrest))
-  ;;         (setq unp rrest)))
-  ;;     (when (zerop i)
-  ;;       (error "oops, `tco--unwrap-progns' infinite looped"))
-  ;;     ff))
   (if (and (eq (car-safe form) 'progn)
            (setq form (cdr form)))
       (let* ((mc (mapcan (lambda (x)
@@ -522,14 +494,15 @@ aforementioned form regardless."
                        'tco-recur recurvars
                        :post-recur ds-setters))
           (env macroexpand-all-environment)
-          (expansion (tco-expand body env recurpoint))
+          (expansion (tco-perform body env recurpoint))
           ((finalbinds . finalbody)
-           (tco-make-body initbinds expansion body)))
+           (tco-make-simple-body initbinds expansion body)))
     (if finalbinds
         `(let* ,finalbinds ,@finalbody)
       (macroexp-progn finalbody))))
 
 (defun tco--lambda-lexical-stuff (args)
+  "Returns (ARGLIST DESTRUCTURING-BINDS)"
   (let (arglist ds-stuff (i 0))
     (dolist (arg args)
       (setq i (1+ i))
