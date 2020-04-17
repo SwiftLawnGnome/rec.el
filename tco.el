@@ -372,105 +372,127 @@ before the last form are removed.
       (--some (tco--tail-some pred (-last-item it)) conds))
     (_ (funcall pred form))))
 
+(defun tco--non-tail-recur-error (name _places args &rest _)
+  (error "Attempted to call %s in non-tail position: %s"
+         name (cons name args)))
+
 (cl-defstruct
     (tco-recursion-point
-      ;; (:copier nil)
-      ;; (:constructor nil)
+      (:copier nil)
+      (:constructor nil)
       (:constructor tco-recursion-point
        (name recur-places
              &key
              pre-recur
              post-recur
-             (non-tail-handler
-              (lambda (&rest args)
-                (error "Attempted to call %s in non-tail position: %s"
-                       name (cons name args))))
-             &aux (temp-name (gensym "recur-point")))))
-  "Instructions for how to convert forms starting with the symbol NAME.
-RECUR-PLACES are the names of variables (or gv places) whose
-values are reset to the arguments to NAME. PRE-RECUR and
-POST-RECUR, if provided, are forms executed before and after
-RECUR-PLACES are reset. NON-TAIL-HANDLER is a function called
-with the args to NAME to produce a form when NAME is in
-non-tail position; by default an error is signaled."
-  name
-  recur-places
-  pre-recur
-  post-recur
-  non-tail-handler
-  temp-name)
+             non-tail-handler
+             tail-handler)))
+  "Instructions for how to convert forms starting with the symbol NAME."
+  (name nil :type symbol :documentation
+        "The name of the form called to recurse.
+  This is `tco-recur' in `tco-loop' and `tco-lambda'.")
+  (recur-places nil :type list :documentation
+                "The set of gv-places to reset to arguments to
+  recursive calls.")
+  (pre-recur nil :documentation
+             "Forms to be executed before each recursive call.")
+  (post-recur nil :documentation
+              "Forms to be executed after each recursive call.")
+  (tail-handler #'tco--make-recur :type function :documentation
+                "The function called to convert recursive calls
+  in tail position. It's passed five arguments: NAME,
+  RECUR-PLACES, the values to set them to, the forms in
+  PRE-RECUR, and the forms in POST-RECUR.")
+  (non-tail-handler #'tco--non-tail-recur-error :documentation
+                    "The function called to convert recursive
+  calls in non-tail position. It is called with the same five
+  arguments as TAIL-HANDLER. The default signals an error.")
+  (temp-name (gensym "recur-point") :type symbol :documentation
+             "A temporary symbol used internally to tag calls to
+  NAME during TCO."))
 
 ;;;###autoload
-(defun tco-expand (body &optional env &rest recursion-points)
+(defun tco-perform (body &optional env retvar &rest recursion-points)
   "Perform tail-call optimization on BODY."
-  (cond
-    ((tco-recursion-point-p env)
-     (push env recursion-points))
-    ((null recursion-points)
-     (error "`tco-expand' requires one or more `tco-recursion-point's.")))
-  (let* ((tco--retvar (make-symbol "result"))
+  (when (tco-recursion-point-p env)
+    (push env recursion-points)
+    (setq env nil))
+  (when (tco-recursion-point-p retvar)
+    (push retvar recursion-points)
+    (setq retvar (make-symbol "result")))
+  (unless recursion-points
+    (error "`tco-perform' requires one or more `tco-recursion-point's."))
+  (let* ((tco--retvar retvar)
          (tco--used-retvar nil)
-         (converted 0)
+         (tco-converted 0)
+         (non-tco-converted 0)
          ;; first expand all macros in BODY and replace all RECURSION-POINTS
          ;; with placeholder forms that are processed in the second pass
          (first-pass
-          (mapcar (-lambda ([_ name _ _ _ _ tempname])
+          (mapcar (-lambda ([_ name _ _ _ _ _ tempname])
                     (cons name (lambda (&rest args)
                                  (cons tempname args))))
                   recursion-points))
          ;; convert all tagged recur points in tail position into forms which
          ;; update their places and continue the while loop
          (second-pass
-          (mapcar (-lambda ([_ _ places pre post _ tempname])
+          (mapcar (-lambda ([_ name places pre post thandler _ tempname])
                     (cons tempname
                           (lambda (&rest args)
-                            (setq converted (1+ converted))
-                            (tco--make-recur places args pre post))))
+                            (unless (= (length args) (length places))
+                              (error "Wrong number of arguments to %s" name))
+                            (setq tco-converted (1+ tco-converted))
+                            (funcall thandler name places args pre post))))
                   recursion-points))
          ;; finally, calls each recur point's non-tail-handler on any calls
          ;; which were not in tail position
          (third-pass
-          (mapcar (-lambda ([_ _ _ _ _ handler tempname])
-                    (cons tempname handler))
+          (mapcar (-lambda ([_ name places pre post _ nthandler tempname])
+                    (cons tempname
+                          (lambda (&rest args)
+                            (setq non-tco-converted (1+ non-tco-converted))
+                            (funcall nthandler name places args pre post))))
                   recursion-points))
          (tagged (macroexpand-all (macroexp-progn body) (nconc first-pass env)))
-         (tco--expansion-env
-          (nconc second-pass tco--special-form-optimizers))
+         (tco--expansion-env (nconc second-pass tco--special-form-optimizers))
          (expanded (tco--mexp tagged))
          (post-processed (macroexpand-all
                           expanded
                           (nconc third-pass tco--special-form-restorers))))
-    (list `(while ,(if (> tco-cleaning-level 0)
-                       (tco--cleanup post-processed)
-                     post-processed))
-          tco--retvar converted tco--used-retvar)))
+    (list (if (> tco-cleaning-level 0)
+              (tco--cleanup post-processed)
+            post-processed)
+          tco--retvar
+          tco--used-retvar
+          tco-converted
+          non-tco-converted)))
 
 ;;;###autoload
-(defun tco-simple-expand (recurname recur-places body &optional env)
-  "Invokes `tco-expand' with appropriate arguments for RECURNAME
+(defun tco-simple-perform (recurname recur-places body &optional env)
+  "Invokes `tco-perform' with appropriate arguments for RECURNAME
 to be a recursive call rebinding RECUR-PLACES."
-  (tco-expand body env (tco-recursion-point recurname recur-places)))
+  (tco-perform body env (tco-recursion-point recurname recur-places)))
 
 ;;;###autoload
-(defun tco-make-body (binds expansion-spec &optional origbody is-lambda?)
+(defun tco-make-simple-body (binds expansion-spec &optional origbody is-lambda?)
   "Takes a list of let BINDS (or function arglist, when
-IS-LAMBDA?) and a list returned by `tco-expand' and returns (cons
+IS-LAMBDA?) and a list returned by `tco-perform' and returns (cons
 BINDS FINAL-ITERATION-FORM). Simply cons `let*' (or `lambda' or
 equivalent) onto it to create the final iteration form. If there
 were no recursive tail calls and ORIGBODY is provided, then
 returns (cons BINDS ORIGBODY) unchanged, else returns the
 aforementioned form regardless."
-  (-let [(whileform retvar recurcount retvarused?) expansion-spec]
+  (-let [(whileform retvar retvarused? recurcount) expansion-spec]
     (cond
       ((and (zerop recurcount) origbody) `(,binds ,@origbody))
       ((not is-lambda?)
        (let ((rv (if retvarused? (list retvar))))
-         `((,@binds ,@rv) ,whileform ,@rv)))
-      ((not retvarused?) `(,binds ,whileform))
-      (t `(,binds (let (,retvar) ,whileform ,retvar))))))
+         `((,@binds ,@rv) (while ,whileform) ,@rv)))
+      ((not retvarused?) `(,binds (while ,whileform)))
+      (t `(,binds (let (,retvar) (while ,whileform) ,retvar))))))
 
 (defun tco--loop-lexical-stuff (binds &optional only-ds-inits)
-  "returns (initial-bindings recur-vars destructuring-setqs)"
+  "returns (INITIAL-BINDINGS RECUR-VARS DESTRUCTURING-SETQS)"
   (let (all-bindings rebinders ds-setters)
     (dolist (bind (tco--normalize-binds binds))
       (-let [(expanded &as (main) . dsbinds)
