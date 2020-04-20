@@ -8,20 +8,17 @@
 ;; Modified: April 14, 2020
 ;; Version: 0.0.1
 ;; Keywords:
-;; Homepage: https://github.com/zach/tco
-;; Package-Requires: ((emacs 28.0.50) (cl-lib "0.5"))
+;; Homepage: https://github.com/SwiftLawnGnome/tco.el
 ;;
 ;; This file is not part of GNU Emacs.
 ;;
 ;;; Commentary:
 ;;
-;;  TODO
+;;  See README.org
 ;;
 ;;; Code:
 
 (require 'dash)
-(require 'dash-functional)
-(require 'cl-lib)
 (require 'cl-macs)
 (require 'macroexp)
 (require 'byte-opt)
