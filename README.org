@@ -1,4 +1,12 @@
-#+TITLE: TCO
-#+SUBTITLE: Recursive tail-call optimization in ELisp
+#+TITLE: Rec
+#+SUBTITLE: Efficient tail-call optimization in ELisp
 
-* TODO
+This library offers both an interface to creating macros with [[https://en.wikipedia.org/wiki/Tail_call][tail-call]]
+conversion and a set of macros, ~rec-let~ and ~rec-lambda~, that do so.
+
+* Why
+** It's expressive
+** It can create more efficient programs
+* TODO Examples
+* TODO Installing
+* TODO Interface
